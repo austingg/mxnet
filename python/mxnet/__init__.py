@@ -38,5 +38,10 @@ from .rtc import Rtc as rtc
 # Attribute scope to add attributes to symbolic graphs
 from .attribute import AttrScope
 
+from . import monitor
+from . import monitor as mon
+
+from . import torch
+from . import torch as th
 
 __version__ = base.__version__

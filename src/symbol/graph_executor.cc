@@ -8,6 +8,7 @@
 #include <mxnet/symbolic.h>
 #include <memory>
 #include <map>
+#include <set>
 #include "./graph_executor.h"
 #include "./graph_algorithm.h"
 
@@ -268,31 +269,192 @@ GraphExecutor::~GraphExecutor() {
   }
 }
 
-void GraphExecutor::InitGraph(const Symbol &symbol, Context ctx, bool need_backward) {
+void GraphExecutor::InitGraph(const Symbol &symbol,
+                              const Context& default_ctx,
+                              const std::map<std::string, Context>& ctx_map,
+                              const std::vector<NDArray> &in_args,
+                              const std::vector<NDArray> &arg_grad_store,
+                              const std::vector<OpReqType> &grad_req_type,
+                              bool need_backward) {
   // initialize all internal data structures
   graph_.FromSymbol(symbol);
-  num_forward_nodes_  = graph_.nodes.size();
   if (need_backward) {
-    graph_.MakeBackwardPass(&head_grad_nodes_, &arg_grads_);
-  }
-  // reorganize so backward node always follow forward
-  // note that this may not be the case, because existence of head_grad_nodes
-  std::vector<uint32_t> topo = graph_.TopoSort();
-  std::vector<uint32_t>  backward;
-  for (uint32_t nid : topo) {
-    if (nid < num_forward_nodes_) {
-      topo_order_.push_back(nid);
-    } else {
-      backward.push_back(nid);
+    std::map<uint32_t, uint32_t> mirror;
+    graph_.MakeBackwardPass(&head_grad_nodes_, &arg_grads_, &mirror);
+    for (auto kv : mirror) {
+      if (kv.first != kv.second) {
+        mirror_source_map_[kv.second] = kv.first;
+      }
     }
   }
-  topo_order_.insert(topo_order_.end(), backward.begin(), backward.end());
+
+  // assign context, this will change the graph.
+  std::vector<Context> ctx_assignment;
+  this->AssignContext(default_ctx, ctx_map,
+                      in_args, arg_grad_store, grad_req_type,
+                      &ctx_assignment);
+
+  // organize topo order so that backward node always falls after forward.
+  std::vector<uint32_t> head_nodes;
+  for (const auto& head : graph_.heads) {
+    head_nodes.push_back(head.source_id);
+  }
+  std::vector<uint32_t> fwd_nodes = graph_.PostDFSOrder(head_nodes, std::unordered_set<uint32_t>());
+  num_forward_nodes_ = fwd_nodes.size();
+
+  std::unordered_set<uint32_t> fwd_set(fwd_nodes.begin(), fwd_nodes.end());
+  std::vector<uint32_t> topo = graph_.TopoSort();
+  std::unordered_set<uint32_t> fwd_bwd_set(topo.begin(), topo.end());
+  std::vector<uint32_t> backward;
+
+  for (uint32_t nid : fwd_nodes) {
+    if (fwd_bwd_set.count(nid) != 0) {
+      topo_order_.push_back(nid);
+    }
+  }
+  for (uint32_t nid : topo) {
+    if (fwd_set.count(nid) == 0) {
+      // TODO(tqchen) find less hacky way to decide mirror node.
+      const std::string& name = graph_.nodes[nid].name;
+      bool is_mirror = graph_.nodes[nid].is_forward() &&
+          name.substr(name.length() - 7, 7) ==  "_mirror";
+      if (!is_mirror) backward.push_back(nid);
+    }
+  }
+  std::unordered_set<uint32_t> finished(fwd_nodes.begin(), fwd_nodes.end());
+  for (uint32_t nid : backward) {
+    std::vector<uint32_t> pass = graph_.PostDFSOrder({nid}, finished);
+    topo_order_.insert(topo_order_.end(), pass.begin(), pass.end());
+    finished.insert(pass.begin(), pass.end());
+  }
+  for (uint32_t nid : topo) {
+    if (finished.count(nid) == 0) topo_order_.push_back(nid);
+  }
   // setup all the operator nodes data structure
   op_nodes_.resize(graph_.nodes.size());
   for (size_t i = 0; i < graph_.nodes.size(); ++i) {
-    op_nodes_[i].ctx = ctx;
+    op_nodes_[i].ctx = ctx_assignment[i];
     op_nodes_[i].outputs.resize(GetNumOutputs(i));
   }
+}
+
+void GraphExecutor::AssignContext(const Context default_ctx,
+                                  const std::map<std::string, Context>& ctx_map,
+                                  const std::vector<NDArray> &in_args,
+                                  const std::vector<NDArray> &arg_grad_store,
+                                  const std::vector<OpReqType> &grad_req_type,
+                                  std::vector<Context> *ctx_plan) {
+  ctx_plan->resize(graph_.nodes.size());
+  std::vector<bool> assigned(graph_.nodes.size(), false);
+  // assign context of node to the bound version
+  for (size_t i = 0; i < graph_.arg_nodes.size(); ++i) {
+    uint32_t nid = graph_.arg_nodes[i];
+    assigned[nid] = true;
+    ctx_plan->at(nid) = in_args[i].ctx();
+  }
+  if (arg_grads_.size() != 0) {
+    for (size_t i = 0; i < arg_grads_.size(); ++i) {
+      if (grad_req_type[i] == kNullOp) continue;
+      auto& e = arg_grads_[i];
+      if (!assigned[e.source_id]) {
+        assigned[e.source_id] = true;
+        ctx_plan->at(e.source_id) = arg_grad_store[i].ctx();
+      } else {
+        CHECK(ctx_plan->at(e.source_id) == arg_grad_store[i].ctx())
+            << "Inconsistent gradient context requirment";
+      }
+    }
+  }
+
+  // topological sort
+  std::vector<uint32_t> topo = graph_.TopoSort();
+  // forward prop
+  for (uint32_t nid : topo) {
+    if (assigned[nid]) continue;
+    auto it = graph_.nodes[nid].attr.find("ctx_group");
+    if (it != graph_.nodes[nid].attr.end()) {
+      const std::string& group = it->second;
+      if (ctx_map.count(group) != 0) {
+        assigned[nid] = true;
+        ctx_plan->at(nid) = ctx_map.at(group);
+      } else {
+        CHECK(ctx_map.size() == 0)
+            << "Context for group " << group << " is not provided in group2ctx map";
+      }
+    }
+    if (assigned[nid]) continue;
+    const StaticGraph::Node& node = graph_.nodes[nid];
+    if (node.is_backward() && assigned[node.backward_source_id]) {
+      ctx_plan->at(nid) = ctx_plan->at(node.backward_source_id);
+      assigned[nid] = true;
+      continue;
+    }
+    for (const StaticGraph::DataEntry& e : node.inputs) {
+      if (assigned[e.source_id]) {
+        ctx_plan->at(nid) = ctx_plan->at(e.source_id);
+        assigned[nid] = true;
+        break;
+      }
+    }
+  }
+  for (size_t i = 0; i < head_grad_nodes_.size(); ++i) {
+    auto& e = graph_.heads[i];
+    uint32_t nid = head_grad_nodes_[i];
+    if (assigned[e.source_id]) {
+      ctx_plan->at(nid) = ctx_plan->at(e.source_id);
+      assigned[nid] = true;
+    }
+  }
+  // backward prop
+  for (auto it = topo.rbegin(); it != topo.rend(); ++it) {
+    const uint32_t nid = *it;
+    if (!assigned[nid]) continue;
+    for (const StaticGraph::DataEntry& e : graph_.nodes[nid].inputs) {
+      if (!assigned[e.source_id]) {
+        ctx_plan->at(e.source_id) = ctx_plan->at(nid);
+        assigned[nid] = true;
+      }
+    }
+  }
+  // assign rest to default context
+  for (uint32_t nid : topo) {
+    if (!assigned[nid]) ctx_plan->at(nid) = default_ctx;
+  }
+  // make sure head gradient is consitent with final operator
+  for (size_t i = 0; i < head_grad_nodes_.size(); ++i) {
+    auto& e = graph_.heads[i];
+    uint32_t nid = head_grad_nodes_[i];
+    ctx_plan->at(nid) = ctx_plan->at(e.source_id);
+  }
+  // automatically create copy node
+  std::map<StaticGraph::DataEntry, std::map<Context, uint32_t> > copy_node;
+  std::vector<StaticGraph::Node> new_nodes;
+
+  for (uint32_t nid : topo) {
+    Context curr_ctx = ctx_plan->at(nid);
+    for (StaticGraph::DataEntry& e : graph_.nodes[nid].inputs) {
+      if (ctx_plan->at(e.source_id) == curr_ctx) continue;
+
+      // create copy node
+      std::map<Context, uint32_t>& rmap = copy_node[e];
+      if (rmap.count(curr_ctx) == 0) {
+        uint32_t new_node_id = static_cast<uint32_t>(graph_.nodes.size() + new_nodes.size());
+        // add a new node
+        StaticGraph::Node new_node = StaticGraph::CreateCopyNode(e);
+        std::ostringstream os;
+        os << graph_.nodes[e.source_id].name << '_' << e.index << "_copynode";
+        new_node.name = os.str();
+        new_nodes.push_back(new_node);
+        rmap[curr_ctx] = new_node_id;
+        ctx_plan->push_back(curr_ctx);
+        CHECK_EQ(ctx_plan->size(), new_node_id + 1);
+      }
+      // muttate e
+      e = StaticGraph::DataEntry(rmap[curr_ctx], 0);
+    }
+  }
+  graph_.nodes.insert(graph_.nodes.end(), new_nodes.begin(), new_nodes.end());
+  CHECK_EQ(graph_.nodes.size(), ctx_plan->size());
 }
 
 void GraphExecutor::InitDataEntryInfo(const std::vector<NDArray> &in_args,
@@ -306,6 +468,8 @@ void GraphExecutor::InitDataEntryInfo(const std::vector<NDArray> &in_args,
     DataEntryInfo &info = op_nodes_[graph_.arg_nodes[i]].outputs[0];
     info.type = kBindByExternal;
     info.data = in_args[i];
+    CHECK(info.data.ctx() == op_nodes_[graph_.arg_nodes[i]].ctx)
+        << "Argument NDArray's context must match the operator's context assignment";
   }
   // setup ref for head nodes
   for (StaticGraph::DataEntry e : graph_.heads) {
@@ -327,6 +491,8 @@ void GraphExecutor::InitDataEntryInfo(const std::vector<NDArray> &in_args,
       info.type = kBindByExternal;
       info.op_req = grad_req_type[i];
       info.data = arg_grad_store[i];
+      CHECK(info.data.ctx() == op_nodes_[grad_source.source_id].ctx)
+          << "Gradient holder NDArray's context must match the operator's context assignment";
       ++info.ref_count;
       op_nodes_[grad_source.source_id].activated = true;
     }
@@ -346,8 +512,10 @@ void GraphExecutor::InitDataEntryInfo(const std::vector<NDArray> &in_args,
         op_nodes_[e.source_id].activated = true;
       }
     }
+    if (graph_.nodes[nid].is_backward()) {
+      op_nodes_[graph_.nodes[nid].backward_source_id].activated = true;
+    }
   }
-
   // shape inference
   std::vector<std::vector<TShape> > out_shapes(op_nodes_.size());
   std::vector<std::vector<TShape> > aux_shapes(op_nodes_.size());
@@ -357,32 +525,59 @@ void GraphExecutor::InitDataEntryInfo(const std::vector<NDArray> &in_args,
   for (size_t i = 0; i < graph_.arg_nodes.size(); ++i) {
     out_shapes[graph_.arg_nodes[i]][0] = in_args[i].shape();
   }
-  CHECK(graph_.InferNodeShapes(topo_order_, &out_shapes, &aux_shapes))
+  CHECK(graph_.InferNodeShapes(topo_order_, &out_shapes, &aux_shapes, false))
       << "Shape inference cannot be complete in bind";
   for (size_t i = 0; i < out_shapes.size(); ++i) {
     for (size_t j = 0; j < out_shapes[i].size(); ++j) {
       op_nodes_[i].outputs[j].shape = out_shapes[i][j];
     }
   }
+  // type inference
+  std::vector<std::vector<int> > out_types(op_nodes_.size());
+  std::vector<std::vector<int> > aux_types(op_nodes_.size());
+  for (size_t i = 0; i < out_types.size(); ++i) {
+    out_types[i].resize(op_nodes_[i].outputs.size(), -1);
+  }
+  for (size_t i = 0; i < graph_.arg_nodes.size(); ++i) {
+    out_types[graph_.arg_nodes[i]][0] = in_args[i].dtype();
+  }
+  CHECK(graph_.InferNodeTypes(topo_order_, &out_types, &aux_types))
+      << "Type inference cannot be complete in bind";
+  for (size_t i = 0; i < out_types.size(); ++i) {
+    for (size_t j = 0; j < out_types[i].size(); ++j) {
+      op_nodes_[i].outputs[j].type_flag = out_types[i][j];
+    }
+  }
   // bind aux args
   size_t aux_ndarray_idx = 0;
-  for (size_t i = 0; i < aux_shapes.size(); ++i) {
+  for (auto i : topo_order_) {
     op_nodes_[i].aux_states.resize(aux_shapes[i].size());
     for (size_t j = 0; j < aux_shapes[i].size(); ++j) {
       DataEntryInfo &info = op_nodes_[i].aux_states[j];
       info.shape = aux_shapes[i][j];
+      info.type_flag = aux_types[i][j];
       info.type = kBindByExternal;
-      if (graph_.nodes[i].backward_source_id == -1) {
-        info.data = aux_states[aux_ndarray_idx++];
+      if (mirror_source_map_.count(i) == 0) {
+        if (graph_.nodes[i].backward_source_id == -1) {
+          info.data = aux_states[aux_ndarray_idx++];
+          CHECK(info.data.ctx() == op_nodes_[i].ctx)
+              << "Auxiliary NDArray's context must match the operator's context assignment";
+        } else {
+          CHECK_NE(graph_.nodes[i].backward_source_id, -1)
+              << "Input auxiliary NDArray is less than required";
+          info.data = op_nodes_[graph_.nodes[i].backward_source_id].aux_states[j].data;
+        }
       } else {
-        CHECK_NE(graph_.nodes[i].backward_source_id, -1)
-          << "Input auxiliary NDArray is less than required";
-        info.data = op_nodes_[graph_.nodes[i].backward_source_id].aux_states[j].data;
+        info.data = op_nodes_[mirror_source_map_[i]].aux_states[j].data;
       }
       CHECK_EQ(info.data.data().shape_, info.shape)
-        << "Incorrect NDArray shape"
-        << " Input: " << info.data.data().shape_
-        << " Desired: " << info.shape;
+          << "Incorrect NDArray shape"
+          << " Input: " << info.data.data().shape_
+          << " Desired: " << info.shape;
+      CHECK_EQ(info.data.dtype(), info.type_flag)
+          << "Incorrect NDArray type"
+          << " Input: " << info.data.dtype()
+          << " Desired: " << info.type_flag;
     }
   }
 }
@@ -396,7 +591,7 @@ void GraphExecutor::InitDataEntryMemory() {
   }
 
   // use allocator to allocate memory.
-  GraphStorageAllocator allocator(&graph_, topo_order_);
+  GraphStorageAllocator allocator(&graph_, topo_order_, shared_mem_);
   for (size_t i = 0; i < topo_order_.size(); ++i) {
     uint32_t nid = topo_order_[i];
     if (!op_nodes_[nid].activated) continue;
@@ -443,7 +638,7 @@ void GraphExecutor::InitDataEntryMemory() {
       }
       if (out->type == kNotInitialized) {
         out->storage_id = allocator.Request(
-            op_nodes_[nid].ctx, out->shape, nid);
+            op_nodes_[nid].ctx, out->type_flag, out->shape, nid);
         out->type = kInternalAllocated;
       }
     }
@@ -468,7 +663,7 @@ void GraphExecutor::InitDataEntryMemory() {
     }
   }
   // one pass complete, allocate real memory
-  this->total_allocated_reals_ = allocator.InitStorages();
+  this->total_allocated_bytes_ = allocator.InitStorages();
   // get the real data NDArray into the DataEntryInfo
   for (size_t i = 0; i < topo_order_.size(); ++i) {
     uint32_t nid = topo_order_[i];
@@ -567,7 +762,7 @@ void GraphExecutor::InitOpNodes() {
     for (DataEntryInfo& info : op_node.outputs) {
       if (info.type == kTobeBindByExternal) allow_cache = false;
     }
-    if (allow_cache) {
+    if (allow_cache && op_node.op->exec_type() != Operator::kCrossDeviceCopy) {
       op_node.cached_exec = GetOpExecEntry(nid);
       op_node.cached_opr = Engine::Get()->NewOperator(
           op_node.cached_exec.exec_fun,
@@ -584,6 +779,15 @@ void GraphExecutor::RunOps(bool is_train, size_t topo_start, size_t topo_end) {
     if (!op_nodes_[nid].activated) continue;
     if (graph_.nodes[nid].is_variable()) continue;
     OpNode& opnode = op_nodes_[nid];
+    // special handle cross device copy op
+    if (opnode.op->exec_type() == Operator::kCrossDeviceCopy) {
+      CHECK_EQ(graph_.nodes[nid].inputs.size(), 1);
+      CHECK_EQ(opnode.outputs.size(), 1);
+      auto in = graph_.nodes[nid].inputs[0];
+      CopyFromTo(op_nodes_[in.source_id].outputs[in.index].data,
+                 &(opnode.outputs[0].data));
+      continue;
+    }
     opnode.op_ctx.is_train = is_train;
     if (opnode.cached_opr != nullptr) {
       Engine::Get()->Push(opnode.cached_opr, opnode.ctx);
@@ -596,6 +800,21 @@ void GraphExecutor::RunOps(bool is_train, size_t topo_start, size_t topo_end) {
           exec.mutate_vars,
           FnProperty::kNormal);
     }
+    if (monitor_callback_) {
+      std::vector<std::string> output_names;
+      if (graph_.nodes[nid].is_forward()) {
+        output_names = graph_.nodes[nid].op->ListOutputs();
+      } else {
+        int source_id = graph_.nodes[nid].backward_source_id;
+        output_names = graph_.nodes[source_id].op->ListArguments();
+      }
+      for (index_t i = 0; i < opnode.outputs.size(); ++i) {
+        NDArray out_data = opnode.outputs[i].data;
+        std::string name = graph_.nodes[nid].name + "_" + output_names[i];
+        NDArray *cpy = new NDArray(out_data);
+        this->monitor_callback_(name.c_str(), reinterpret_cast<void*>(cpy));
+      }
+    }
   }
 }
 
@@ -604,7 +823,10 @@ void GraphExecutor::Print(std::ostream &os) const {
   for (size_t i = 0; i < topo_order_.size(); ++i) {
     uint32_t nid = topo_order_[i];
     if (!op_nodes_[nid].activated) continue;
-    os << "Op " << i << ":" << graph_.nodes[nid].name << '\n';
+    os << "Op " << i << ":" << graph_.nodes[nid].name << " ctx=";
+    Context ctx = op_nodes_[nid].ctx;
+    os << (ctx.dev_mask() == cpu::kDevMask? "cpu" : "gpu");
+    os << '(' << ctx.dev_id << ")\n";
     for (size_t j = 0; j < op_nodes_[nid].outputs.size(); ++j) {
       const DataEntryInfo &info = op_nodes_[nid].outputs[j];
       os << "\toutput[" << j << "]: shape=" << info.shape;
@@ -627,12 +849,21 @@ void GraphExecutor::Print(std::ostream &os) const {
       os << '\n';
     }
   }
-  os << "Total " << (total_allocated_reals_ >> 18UL) <<" MB allocated\n";
+  os << "Total " << (total_allocated_bytes_ >> 20UL) <<" MB allocated\n";
   os << "Total " << total_allocated_temp_ <<" TempSpace resource requested\n";
 }
 
 void GraphExecutor::Forward(bool is_train) {
   RunOps(is_train, 0, num_forward_nodes_);
+}
+
+void GraphExecutor::PartialForward(bool is_train, int step, int *step_left) {
+  size_t sstep = static_cast<size_t>(step);
+  if (sstep >= num_forward_nodes_) {
+    *step_left = 0; return;
+  }
+  RunOps(is_train, sstep, sstep + 1);
+  *step_left = static_cast<int>(num_forward_nodes_ - sstep - 1);
 }
 
 void GraphExecutor::Backward(const std::vector<NDArray> &head_grads) {
@@ -645,6 +876,8 @@ void GraphExecutor::Backward(const std::vector<NDArray> &head_grads) {
       DataEntryInfo &info = op_nodes_[nid].outputs[0];
       CHECK_EQ(info.type, kTobeBindByExternal);
       info.data = head_grads[i];
+      CHECK(op_nodes_[nid].ctx == head_grads[i].ctx())
+          << "Head Gradient context do not match the context of output op";
     }
   } else {
     // check all the head_grad_nodes need to have zero ref_count
@@ -661,13 +894,16 @@ void GraphExecutor::Backward(const std::vector<NDArray> &head_grads) {
 }
 
 Executor *Executor::Bind(Symbol symbol,
-                         Context ctx,
+                         const Context& default_ctx,
+                         const std::map<std::string, Context>& group2ctx,
                          const std::vector<NDArray> &in_args,
                          const std::vector<NDArray> &arg_grad_store,
                          const std::vector<OpReqType> &grad_req_type,
-                         const std::vector<NDArray> &aux_states) {
+                         const std::vector<NDArray> &aux_states,
+                         Executor* shared_exec) {
   GraphExecutor *exec = new GraphExecutor();
-  exec->Init(symbol, ctx, in_args, arg_grad_store, grad_req_type, aux_states);
+  exec->Init(symbol, default_ctx, group2ctx,
+             in_args, arg_grad_store, grad_req_type, aux_states, shared_exec);
   return exec;
 }
 }  // namespace mxnet

@@ -1,6 +1,7 @@
 import find_mxnet
 import mxnet as mx
 import logging
+import os
 
 def fit(args, network, data_loader):
     # kvstore
@@ -8,10 +9,24 @@ def fit(args, network, data_loader):
 
     # logging
     head = '%(asctime)-15s Node[' + str(kv.rank) + '] %(message)s'
-    logging.basicConfig(level=logging.DEBUG, format=head)
-    logging.info('start with arguments %s', args)
+    if 'log_file' in args and args.log_file is not None:
+        log_file = args.log_file
+        log_dir = args.log_dir
+        log_file_full_name = os.path.join(log_dir, log_file)
+        if not os.path.exists(log_dir):
+            os.mkdir(log_dir)
+        logger = logging.getLogger()
+        handler = logging.FileHandler(log_file_full_name)
+        formatter = logging.Formatter(head)
+        handler.setFormatter(formatter)
+        logger.addHandler(handler)
+        logger.setLevel(logging.DEBUG)
+        logger.info('start with arguments %s', args)
+    else:
+        logging.basicConfig(level=logging.DEBUG, format=head)
+        logging.info('start with arguments %s', args)
 
-    # load model?
+    # load model
     model_prefix = args.model_prefix
     if model_prefix is not None:
         model_prefix += "-%d" % (kv.rank)
@@ -22,7 +37,7 @@ def fit(args, network, data_loader):
         model_args = {'arg_params' : tmp.arg_params,
                       'aux_params' : tmp.aux_params,
                       'begin_epoch' : args.load_epoch}
-    # save model?
+    # save model
     checkpoint = None if model_prefix is None else mx.callback.do_checkpoint(model_prefix)
 
     # data
@@ -43,6 +58,14 @@ def fit(args, network, data_loader):
             step = max(int(epoch_size * args.lr_factor_epoch), 1),
             factor = args.lr_factor)
 
+    if 'clip_gradient' in args and args.clip_gradient is not None:
+        model_args['clip_gradient'] = args.clip_gradient
+
+    # disable kvstore for single device
+    if 'local' in kv.type and (
+            args.gpus is None or len(args.gpus.split(',')) is 1):
+        kv = None
+
     model = mx.model.FeedForward(
         ctx                = devs,
         symbol             = network,
@@ -50,6 +73,7 @@ def fit(args, network, data_loader):
         learning_rate      = args.lr,
         momentum           = 0.9,
         wd                 = 0.00001,
+        initializer        = mx.init.Xavier(factor_type="in", magnitude=2.34),
         **model_args)
 
     model.fit(

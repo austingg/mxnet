@@ -32,6 +32,12 @@ The committers are the granted write access to the project.
   - KK is a R ninja, he makes mxnet available for R users.
 * [Tong He](https://github.com/hetong007)
   - Tong is the major maintainer of MXNetR, he designs the mxnet interface and wrote many of the tutorials on R.
+* [Yizhi Liu](https://github.com/javelinjs)
+  - Yizhi is the main creator on mxnet scala project to make deep learning available for JVM stacks.
+* [Zixuan Huang](https://github.com/yanqingmen)
+  - Zixuan is one of major maintainers of mxnet scala package.
+* [Yuan Tang](https://github.com/terrytangyuan)
+  - Yuan is one of major maintainers of mxnet scala package.
 
 ### Become a Comitter
 MXNet is a opensource project and we are actively looking for new comitters
@@ -60,8 +66,6 @@ List of Contributors
 * [Nan Xiao](https://github.com/road2stat)
 * [Junyuan Xie](https://github.com/piiswrong)
 * [Wei Wu](https://github.com/tornadomeet)
-* [Yuan Tang](https://github.com/terrytangyuan)
-  - Yuan set up the R Travis environment to make development safer.
 * [Michaël Benesty](https://github.com/pommedeterresautee)
   -Michaël contributes the R visualization module of mxnet
 * [Kublai Jing](https://github.com/Kublai-Jing)
@@ -75,3 +79,27 @@ List of Contributors
 * [Guosheng Dong](https://github.com/dongguosheng)
 * [yang1fan2](https://github.com/yang1fan2)
 * [Wang Gu](https://github.com/wangg12)
+* [Zhenchuan Huang](https://github.com/chuan92)
+* [Hang Su](https://github.com/suhangpro)
+* [Rinu Boney](https://github.com/rinuboney)
+* [nowozin](https://github.com/nowozin)
+* [Mathis](https://github.com/sveitser)
+* [sennendoko](https://github.com/sennendoko)
+* [srand99](https://github.com/srand99)
+* [Yizhi Liu](https://github.com/javelinjs)
+* [Taiyun](https://github.com/taiyun)
+* [Yanghao Li](https://github.com/lyttonhao)
+* [Nan Zhu](https://github.com/CodingCat)
+* [Ye Zhou](https://github.com/zhouye)
+* [Zhang Chen](https://github.com/zhangchen-qinyinghua)
+* [Xianliang Wang](https://github.com/wangxianliang)
+* [Junru Shao](https://github.com/yzgysjr)
+* [Xiao Liu](https://github.com/skylook)
+* [Lowik CHANUSSOT](https://github.com/Nzeuwik)
+* [Alexander Skidanov](https://github.com/SkidanovAlex)
+* [Ruixiang Zhang](https://github.com/sodabeta7)
+* [Lodewic van Twillert](https://github.com/Lodewic)
+* [Aditya Kumar](https://github.com/hiraditya)
+* [Dan Becker](https://github.com/dansbecker)
+* [Yun Yan](https://github.com/Puriney)
+* [Tao Wei](https://github.com/taoari)

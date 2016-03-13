@@ -15,6 +15,7 @@
 #include <string>
 #include <utility>
 #include "./base.h"
+#include "./c_api.h"
 #include "./ndarray.h"
 #include "./operator.h"
 
@@ -138,29 +139,66 @@ class Symbol {
    *     For unknown shapes, InferShape will try to fill in the correct Shape in in_shape
    *     For known shapes, InferShape will check shape consistency
    *
-   *     common practice: set the shape of data input, and usually weight's shape can be infered
+   *     common practice: set the shape of data input, and usually weight's shape can be inferred
    *
-   * \param out_shapes Use to store the infered shapes of outputs.
-   * \param aux_shapes Use to store the infered shapes of auxiliary states
+   * \param out_shapes Use to store the inferred shapes of outputs.
+   * \param aux_shapes Use to store the inferred shapes of auxiliary states
+   * \param partial_infer Return partially inferred results if true.
    * \return true if the shape inference is successful, false if there is not enough information.
    * \throws dmlc::Error if the known arg_shapes are inconsistent.
    */
   bool InferShape(std::vector<TShape> *arg_shapes,
                   std::vector<TShape> *out_shapes,
-                  std::vector<TShape> *aux_shapes) const;
+                  std::vector<TShape> *aux_shapes,
+                  bool partial_infer = false) const;
+
   /*!
    * \brief infer the shapes by providing shapes of known arguments.
    * \param known_arg_shapes map of argument name to shape of arguments with known shapes.
-   * \param arg_shapes used to store infered shapes of arguments.
-   * \param out_shapes used to store infered shapes of outputs.
-   * \param aux_shapes Use to store the infered shapes of auxiliary states
+   * \param arg_shapes used to store inferred shapes of arguments.
+   * \param out_shapes used to store inferred shapes of outputs.
+   * \param aux_shapes Use to store the inferred shapes of auxiliary states
+   * \param partial_infer Return partially inferred results if true.
    * \return true if the shape inference is successful, false if there is not enough information.
    * \throws dmlc::Error if the known arg_shapes are inconsistent.
    */
   bool InferShape(const std::unordered_map<std::string, TShape> &known_arg_shapes,
                   std::vector<TShape> *arg_shapes,
                   std::vector<TShape> *out_shapes,
-                  std::vector<TShape> *aux_shapes) const;
+                  std::vector<TShape> *aux_shapes,
+                  bool partial_infer = false) const;
+
+  /*!
+   * \brief infer the types of outputs and unknown input arguments
+   * \param arg_types the type of input arguments of the operator
+   *     this should be of same length as the vector returned by ListArguments
+   *     in_type allows unknown elements, which are checked by type.ndim() == 0.
+   *     For unknown types, Infertype will try to fill in the correct type in in_type
+   *     For known types, Infertype will check type consistency
+   *
+   *     common practice: set the type of data input, and usually weight's type can be inferred
+   *
+   * \param out_types Use to store the inferred types of outputs.
+   * \param aux_types Use to store the inferred types of auxiliary states
+   * \return true if the type inference is successful, false if there is not enough information.
+   * \throws dmlc::Error if the known arg_types are inconsistent.
+   */
+  bool InferType(std::vector<int> *arg_types,
+                  std::vector<int> *out_types,
+                  std::vector<int> *aux_types) const;
+  /*!
+   * \brief infer the types by providing types of known arguments.
+   * \param known_arg_types map of argument name to type of arguments with known types.
+   * \param arg_types used to store inferred types of arguments.
+   * \param out_types used to store inferred types of outputs.
+   * \param aux_types Use to store the inferred types of auxiliary states
+   * \return true if the type inference is successful, false if there is not enough information.
+   * \throws dmlc::Error if the known arg_types are inconsistent.
+   */
+  bool InferType(const std::unordered_map<std::string, int> &known_arg_types,
+                  std::vector<int> *arg_types,
+                  std::vector<int> *out_types,
+                  std::vector<int> *aux_types) const;
   /*!
    * \brief interface for json serialization.
    * \param writer the JSON writer write json.
@@ -271,6 +309,15 @@ class Executor {
    */
   virtual void Forward(bool is_train) = 0;
   /*!
+   * \brief Perform a Partial Forward operation of Operator.
+   *  Only issue operation specified by step.
+   *  The caller must keep calling PartialForward with increasing steps, until step_left=0.
+   * \param is_train Whether this is training phase.
+   * \param step current step, user can always start from 0
+   * \param step_left Number of steps left to finish the forward.
+   */
+  virtual void PartialForward(bool is_train, int step, int *step_left) = 0;
+  /*!
    * \brief Perform a Backward operation of the Operator.
    *  This must be called after Forward.
    *  After this operation, NDArrays specified by grad_in_args_store will be updated accordingly.
@@ -294,20 +341,32 @@ class Executor {
    * \brief Create an operator by bind symbol with context and arguments.
    *  If user do not want to compute the gradients of i-th argument, grad_req_type[i] can be kNullOp.
    *
-   * \param ctx the context of binding.
+   * \param default_ctx the default context of binding.
+   * \param group2ctx Context mapping group to context.
    * \param symbol the symbol that specifies the output of Forward pass.
    * \param in_args the NDArray that stores the input arguments to the symbol.
    * \param arg_grad_store NDArray that is used to store the gradient output of the input arguments.
    * \param grad_req_type requirment type of gradient saving. Can only be in {kNullOp, kAddTo, kWriteTo}.
    * \param aux_states NDArray that is used as internal state in op
+   * \param shared_exec input executor to share memory with.
    * \return a new executor.
    */
   static Executor *Bind(Symbol symbol,
-                        Context ctx,
+                        const Context& default_ctx,
+                        const std::map<std::string, Context>& group2ctx,
                         const std::vector<NDArray> &in_args,
                         const std::vector<NDArray> &arg_grad_store,
                         const std::vector<OpReqType> &grad_req_type,
-                        const std::vector<NDArray> &aux_states);
+                        const std::vector<NDArray> &aux_states,
+                        Executor* shared_exec = NULL);
+  /*!
+   * \brief the prototype of user-defined monitor callback
+   */
+  typedef std::function<void(const char*, void*)> MonitorCallback;
+  /*!
+   * \brief Install a callback to notify the completion of operation.
+   */
+  virtual void SetMonitorCallback(const MonitorCallback& callback) {}
 };  // class operator
 }  // namespace mxnet
 #endif  // MXNET_SYMBOLIC_H_
