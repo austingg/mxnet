@@ -13,7 +13,9 @@ parser.add_argument('--network', type=str, default='inception-bn',
 parser.add_argument('--data-dir', type=str, required=True,
                     help='the input data directory')
 parser.add_argument('--model-prefix', type=str,
-                    help='the prefix of the model to load/save')
+                    help='the prefix of the model to load')
+parser.add_argument('--save-model-prefix', type=str,
+                    help='the prefix of the model to save')
 parser.add_argument('--lr', type=float, default=.01,
                     help='the initial learning rate')
 parser.add_argument('--lr-factor', type=float, default=1,
@@ -28,7 +30,7 @@ parser.add_argument('--load-epoch', type=int,
                     help="load the model on an epoch using the model-prefix")
 parser.add_argument('--batch-size', type=int, default=32,
                     help='the batch size')
-parser.add_argument('--gpus', type=str, default='0',
+parser.add_argument('--gpus', type=str,
                     help='the gpus will be used, e.g "0,1,2,3"')
 parser.add_argument('--kv-store', type=str, default='local',
                     help='the kvstore type')

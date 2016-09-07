@@ -1,12 +1,19 @@
 package ml.dmlc.mxnet
 
 import ml.dmlc.mxnet.Base._
+import org.slf4j.{LoggerFactory, Logger}
 
 /**
  * Key value store interface of MXNet for parameter synchronization.
  * @author Yizhi Liu
  */
 object KVStore {
+
+  // group id of scheduler/server/worker
+  val GROUP_NODE_SCHEDULER = 1
+  val GROUP_NODE_SERVER = 2
+  val GROUP_NODE_WORKER = 4
+
   /**
    * Create a new KVStore. <br />
    * <b>
@@ -28,7 +35,8 @@ object KVStore {
 }
 
 // scalastyle:off finalize
-class KVStore(private val handle: KVStoreHandle) {
+class KVStore(private[mxnet] val handle: KVStoreHandle) {
+  private val logger: Logger = LoggerFactory.getLogger(classOf[KVStore])
   private var updaterFunc: MXKVStoreUpdater = null
   private var disposed = false
 
@@ -175,9 +183,11 @@ class KVStore(private val handle: KVStoreHandle) {
   def setOptimizer(optimizer: Optimizer): Unit = {
     val isWorker = new RefInt
     checkCall(_LIB.mxKVStoreIsWorkerNode(isWorker))
-    if ("dist" == `type` && isWorker.value != 0) {
+    if (`type`.contains("dist") && isWorker.value != 0) {
       val optSerialized = Serializer.getSerializer.serialize(optimizer)
-      sendCommandToServers(0, Serializer.encodeBase64String(optSerialized))
+      val cmd = Serializer.encodeBase64String(optSerialized)
+      logger.debug("Send optimizer to server: {}", cmd)
+      sendCommandToServers(0, cmd)
     } else {
       setUpdater(Optimizer.getUpdater(optimizer))
     }
@@ -204,8 +214,23 @@ class KVStore(private val handle: KVStoreHandle) {
    * pulling, we can place a barrier to guarantee that the initialization is
    * finished.
    */
-  def barrier() {
+  def barrier(): Unit = {
     checkCall(_LIB.mxKVStoreBarrier(handle))
+  }
+
+  def numDeadNode(nodeId: Int): Int = {
+    val number = new RefInt
+    checkCall(_LIB.mxKVStoreGetNumDeadNode(handle, nodeId, number))
+    number.value
+  }
+
+  /**
+   * Whether to do barrier when the kvstore finalizes
+   * @param barrierBeforeExit
+   */
+  def setBarrierBeforeExit(barrierBeforeExit: Boolean): Unit = {
+    val flag: Int = if (barrierBeforeExit) 1 else 0
+    checkCall(_LIB.mxKVStoreSetBarrierBeforeExit(handle, flag))
   }
 
   /**

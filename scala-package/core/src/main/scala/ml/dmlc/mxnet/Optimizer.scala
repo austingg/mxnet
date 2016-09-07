@@ -7,17 +7,19 @@ object Optimizer {
     new MXKVStoreUpdater {
       val states = new scala.collection.mutable.HashMap[Int, AnyRef]
       override def update(index: Int, grad: NDArray, weight: NDArray): Unit = {
-        val state = states.getOrElseUpdate(index, optimizer.createState(index, weight))
+        val state =
+          if (states.contains(index)) {
+            states.get(index).get
+          } else {
+            val newState = optimizer.createState(index, weight)
+            states.put(index, newState)
+            newState
+          }
         optimizer.update(index, weight, grad, state)
       }
       override def dispose(): Unit = {
-        states.values.foreach {
-          case array: NDArray => array.dispose()
-          case sym: Symbol => sym.dispose()
-          case exec: Executor => exec.dispose()
-          case kv: KVStore => kv.dispose()
-          case _ =>
-        }
+        states.values.foreach(optimizer.disposeState)
+        states.clear()
       }
     }
   }
@@ -46,6 +48,9 @@ abstract class Optimizer extends Serializable {
   // Create additional optimizer state such as momentum.
   // TODO: make returned state a ClassTag
   def createState(index: Int, weight: NDArray): AnyRef
+
+  // Dispose the state it created
+  def disposeState(state: AnyRef): Unit
 
   // Set individual learning rate scale for parameters
   def setLrScale(lrScale: Map[Int, Float]) {
@@ -80,6 +85,18 @@ abstract class Optimizer extends Serializable {
     val count = indexUpdateCount.getOrElseUpdate(index, 0) + 1
     indexUpdateCount.update(index, count)
     numUpdate = Math.max(count, numUpdate)
+  }
+
+  protected def getWd(index: Int, wd: Float): Float = {
+    if (specialized) {
+      if (this.weightSet.contains(index)) {
+        wd
+      } else {
+        0f
+      }
+    } else {
+      wd
+    }
   }
 }
 

@@ -98,19 +98,26 @@ class Executor(object):
         >>> # doing forward by not specifying things, but copy to the executor before hand
         >>> mydata.copyto(texec.arg_dict['data'])
         >>> texec.forward(is_train=True)
+        >>> # doing forward by specifying data and get outputs
+        >>> outputs = texec.forward(is_train=True, data=mydata)
+        >>> print(outputs[0].asnumpy())
         """
         if len(kwargs) != 0:
             arg_dict = self.arg_dict
             for name, array in kwargs.items():
-                if not isinstance(array, NDArray):
-                    raise ValueError('only accept keyword argument of NDArrays')
+                if not isinstance(array, (NDArray, np.ndarray)):
+                    raise ValueError('only accept keyword argument of NDArrays and numpy.ndarray')
                 if name not in arg_dict:
                     raise TypeError('Unknown argument %s' % name)
-                array.copyto(arg_dict[name])
+                if arg_dict[name].shape != array.shape:
+                    raise ValueError('Shape not match! Argument %s, need: %s, received: %s'
+                                     %(name, str(arg_dict[name].shape), str(array.shape)))
+                arg_dict[name][:] = array
 
         check_call(_LIB.MXExecutorForward(
             self.handle,
             ctypes.c_int(int(is_train))))
+        return self.outputs
 
     def backward(self, out_grads=None):
         """Do backward pass to get the gradient of arguments.
@@ -224,7 +231,8 @@ class Executor(object):
         """
         for name, array in arg_params.items():
             if name in self.arg_dict:
-                array.copyto(self.arg_dict[name])
+                dst = self.arg_dict[name]
+                array.astype(dst.dtype).copyto(dst)
             else:
                 if not allow_extra_params:
                     raise ValueError('Find name \"%s\" that is not in the arguments' % name)
@@ -232,7 +240,8 @@ class Executor(object):
             aux_params = {}
         for name, array in aux_params.items():
             if name in self.aux_dict:
-                array.copyto(self.aux_dict[name])
+                dst = self.aux_dict[name]
+                array.astype(dst.dtype).copyto(dst)
             else:
                 if not allow_extra_params:
                     raise ValueError('Find name %s that is not in the auxiliary states' % name)
@@ -259,7 +268,7 @@ class Executor(object):
         """
         # pylint: disable=too-many-branches
         arg_shapes, _, aux_shapes = self._symbol.infer_shape(**kwargs)
-        if arg_shapes == None:
+        if arg_shapes is None:
             raise ValueError("Insufficient argument shapes provided.")
 
         new_arg_dict = {}
@@ -327,4 +336,3 @@ class Executor(object):
         check_call(_LIB.MXExecutorPrint(
             self.handle, ctypes.byref(debug_str)))
         return py_str(debug_str.value)
-

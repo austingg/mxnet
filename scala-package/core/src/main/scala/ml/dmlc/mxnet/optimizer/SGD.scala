@@ -10,6 +10,11 @@ import ml.dmlc.mxnet.NDArrayConversions._
 class SGD(private val learningRate: Float = 0.01f, private val momentum: Float = 0.0f,
           private val wd: Float = 0.0001f, private val clipGradient: Float = 0f,
           private val lrScheduler: LRScheduler = null) extends Optimizer {
+
+  if (lrScheduler != null) {
+    lrScheduler.baseLR = learningRate
+  }
+
   /**
    * Update the parameters.
    * @param index An unique integer key used to index the parameters
@@ -29,17 +34,7 @@ class SGD(private val learningRate: Float = 0.01f, private val momentum: Float =
         this.learningRate
       }) * lrScale.getOrElse(index, 1f)
 
-    val wd =
-      if (specialized) {
-        if (this.weightSet.contains(index)) {
-          this.wd
-        } else {
-          0f
-        }
-      } else {
-        this.wd
-      }
-
+    val wd = getWd(index, this.wd)
     var resdGrad = grad * this.rescaleGrad
     if (clipGradient != 0f) {
       // to get rid of memory leak
@@ -79,6 +74,13 @@ class SGD(private val learningRate: Float = 0.01f, private val momentum: Float =
       null
     } else {
       NDArray.zeros(weight.shape, weight.context)
+    }
+  }
+
+  // Dispose the state it created
+  override def disposeState(state: AnyRef): Unit = {
+    if (state != null) {
+      state.asInstanceOf[NDArray].dispose()
     }
   }
 }
